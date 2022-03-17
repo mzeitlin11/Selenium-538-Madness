@@ -2,9 +2,10 @@ mod simulate;
 mod teams;
 mod tournament;
 
-use crate::teams::write_teams;
 use clap::Parser;
 use thirtyfour::{DesiredCapabilities, WebDriver};
+
+use crate::teams::write_teams;
 
 const SELENIUM_SERVER_URL: &str = "http://localhost:4444/wd/hub";
 const URL: &str = "https://projects.fivethirtyeight.com/2022-march-madness-predictions/";

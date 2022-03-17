@@ -1,10 +1,13 @@
-use crate::teams::Team;
-use anyhow::anyhow;
-use rand::random;
-use serde::{Deserialize, Serialize};
 use std::fmt::{Display, Formatter};
 use std::str::FromStr;
 
+use anyhow::anyhow;
+use colored::*;
+use serde::{Deserialize, Serialize};
+
+use crate::teams::Team;
+
+/// Bracket regions
 #[derive(Copy, Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 pub enum Region {
     West,
@@ -14,6 +17,7 @@ pub enum Region {
 }
 
 impl Region {
+    /// Indexed such that the winner of Region 0 plays 1, 2 plays 3
     pub fn to_ind(self) -> usize {
         match self {
             Self::West => 0,
@@ -53,6 +57,7 @@ impl FromStr for Region {
     }
 }
 
+/// Seed in the bracket
 #[derive(Copy, Clone, Debug, Deserialize, Serialize, Ord, PartialOrd, Eq, PartialEq)]
 pub struct Seed(pub u8);
 
@@ -66,12 +71,7 @@ impl Seed {
     }
 }
 
-#[derive(Debug, Copy, Clone, Default)]
-pub struct Matchup<'a> {
-    teams: [Option<&'a str>; 2],
-    winner: Option<MatchupInd>,
-}
-
+/// Representation of teams in a matchup (basicially a more readable boolean indicator)
 #[derive(Debug, Copy, Clone, Deserialize, Serialize, Eq, PartialEq)]
 pub enum MatchupInd {
     Team1,
@@ -87,7 +87,35 @@ impl MatchupInd {
     }
 }
 
+/// One matchup in a round
+#[derive(Debug, Copy, Clone, Default)]
+pub struct Matchup<'a> {
+    /// Teams playing in this matchup, None if not determined yet
+    teams: [Option<&'a str>; 2],
+    /// Who won the matchup, None if not complete
+    winner: Option<MatchupInd>,
+}
+
 impl<'a> Matchup<'a> {
+    /// Get the competing teams, should only be called when both teams exist
+    pub fn teams(&self) -> [String; 2] {
+        [
+            self.teams[0].unwrap().to_string(),
+            self.teams[1].unwrap().to_string(),
+        ]
+    }
+
+    /// Set the winner of this matchup
+    pub fn set_winner(&mut self, winner: MatchupInd) {
+        self.winner = Some(winner);
+    }
+
+    /// Return the winner of this matchup. Panics if the winner was not set
+    pub fn winner(&self) -> &'a str {
+        self.teams[self.winner.unwrap().to_ind()].unwrap()
+    }
+
+    /// Include a team in this matchup. Must have space for another team
     fn add_team(&mut self, name: &'a str) -> &mut Self {
         if self.teams[0].is_none() {
             self.teams[0] = Some(name)
@@ -99,38 +127,37 @@ impl<'a> Matchup<'a> {
         self
     }
 
-    pub fn set_winner(&mut self, winner: MatchupInd) {
-        self.winner = Some(winner);
-    }
-
-    pub fn winner(&self) -> &'a str {
-        self.teams[self.winner.unwrap().to_ind()].unwrap()
-    }
-
     fn team_won(&self, team: MatchupInd) -> bool {
         self.winner == Some(team)
     }
 
-    fn get_team_display(&self, ind: MatchupInd) -> String {
+    fn get_team_display(&self, ind: MatchupInd) -> ColoredString {
         let name = self.teams[ind.to_ind()].unwrap_or("___");
-        format!("{} {}", name, if self.team_won(ind) { "(won)" } else { "" })
+        if self.team_won(ind) {
+            name.green()
+        } else {
+            name.red()
+        }
     }
 }
 
 impl<'a> Display for Matchup<'a> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(
+        writeln!(
             f,
-            "{} vs {}\n",
+            "{} vs {}",
             self.get_team_display(MatchupInd::Team1),
             self.get_team_display(MatchupInd::Team2)
         )
     }
 }
 
+/// Tournament round
 #[derive(Copy, Clone, Debug, Serialize, Deserialize)]
 pub enum RoundKind {
+    /// Play-in round
     PlayIn,
+    /// Round 1, 2, etc
     Round(usize),
 }
 
@@ -143,12 +170,16 @@ impl Display for RoundKind {
     }
 }
 
+/// Round in a tournament
 pub struct Round<'a> {
+    /// What round this is
     pub round: RoundKind,
+    /// The matchups in this round
     pub matchups: Vec<Matchup<'a>>,
 }
 
 impl<'a> Round<'a> {
+    /// Initialize an empty normal round
     pub fn new(round: usize) -> Self {
         let num_matchups = 2_usize.pow((6 - round) as u32);
         let matchups = vec![Matchup::default(); num_matchups];
@@ -158,6 +189,7 @@ impl<'a> Round<'a> {
         }
     }
 
+    /// Initialize a round from a complete matchup set
     pub fn with_matchups(round: usize, matchups: Vec<Matchup<'a>>) -> Self {
         Self {
             round: RoundKind::Round(round),
@@ -181,6 +213,7 @@ impl<'a> Display for Round<'a> {
     }
 }
 
+/// Matchup number for a given seed in their region going top to bottom
 fn matchup_ind(mut seed: u8) -> usize {
     if seed > 8 {
         seed = 17 - seed;
@@ -198,11 +231,14 @@ fn matchup_ind(mut seed: u8) -> usize {
     }
 }
 
+/// A complete tournament
 pub struct Tournament<'a> {
+    /// All rounds played
     pub rounds: Vec<Round<'a>>,
 }
 
 impl<'a> Tournament<'a> {
+    /// Initialize from a list of teams. The first round will be set using these teams
     pub fn new(teams: &'a [Team]) -> Self {
         let mut round1 = Round::new(1);
         for team in teams {
@@ -219,6 +255,7 @@ impl<'a> Tournament<'a> {
         }
     }
 
+    /// Construct the next round of matchups from a completed previous round
     pub fn initialize_next_round(&mut self) {
         let prev_winners = self
             .rounds

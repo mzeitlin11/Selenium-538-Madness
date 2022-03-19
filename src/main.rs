@@ -10,9 +10,13 @@ use crate::teams::write_teams;
 const SELENIUM_SERVER_URL: &str = "http://localhost:4444/wd/hub";
 const URL: &str = "https://projects.fivethirtyeight.com/2022-march-madness-predictions/";
 
+/// What task to run
 #[derive(PartialEq, Debug, Copy, Clone, clap::ArgEnum)]
 pub enum Task {
+    /// Write out team information using 538 names (for using later within
+    /// CSS selectors)
     WriteTeamsTable,
+    /// Simulate the tournament using 538 predictions  
     Simulate,
 }
 

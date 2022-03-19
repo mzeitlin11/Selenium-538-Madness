@@ -1,11 +1,13 @@
+use std::collections::{HashMap, HashSet};
 use std::fmt::{Display, Formatter};
+use std::hash::Hash;
 use std::str::FromStr;
 
 use anyhow::anyhow;
 use colored::*;
 use serde::{Deserialize, Serialize};
 
-use crate::teams::Team;
+use crate::teams::{construct_html_name, Team};
 
 /// Bracket regions
 #[derive(Copy, Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
@@ -88,20 +90,28 @@ impl MatchupInd {
 }
 
 /// One matchup in a round
-#[derive(Debug, Copy, Clone, Default)]
-pub struct Matchup<'a> {
+#[derive(Debug, Clone, Default)]
+pub struct Matchup {
     /// Teams playing in this matchup, None if not determined yet
-    teams: [Option<&'a str>; 2],
+    teams: [Option<String>; 2],
     /// Who won the matchup, None if not complete
     winner: Option<MatchupInd>,
+    /// What # matchup this is in the round (used so we know where to advance the winner to)
+    index: usize,
 }
 
-impl<'a> Matchup<'a> {
+impl Matchup {
+    pub fn new(index: usize) -> Self {
+        Self {
+            index,
+            ..Default::default()
+        }
+    }
     /// Get the competing teams, should only be called when both teams exist
     pub fn teams(&self) -> [String; 2] {
         [
-            self.teams[0].unwrap().to_string(),
-            self.teams[1].unwrap().to_string(),
+            self.teams[0].as_ref().unwrap().clone(),
+            self.teams[1].as_ref().unwrap().clone(),
         ]
     }
 
@@ -110,17 +120,35 @@ impl<'a> Matchup<'a> {
         self.winner = Some(winner);
     }
 
-    /// Return the winner of this matchup. Panics if the winner was not set
-    pub fn winner(&self) -> &'a str {
-        self.teams[self.winner.unwrap().to_ind()].unwrap()
+    pub fn set_winning_team(&mut self, team: &str) {
+        if self.is_team_ind(team, MatchupInd::Team1) {
+            self.set_winner(MatchupInd::Team1);
+        } else {
+            self.set_winner(MatchupInd::Team2);
+        }
+    }
+
+    pub fn includes_team(&self, team: &str) -> bool {
+        self.is_team_ind(team, MatchupInd::Team1) || self.is_team_ind(team, MatchupInd::Team2)
+    }
+
+    fn is_team_ind(&self, team: &str, ind: MatchupInd) -> bool {
+        self.teams[ind.to_ind()]
+            .as_ref()
+            .map(|t| t == team)
+            .unwrap_or_default()
+    }
+
+    pub fn completed(&self) -> bool {
+        self.winner.is_some()
     }
 
     /// Include a team in this matchup. Must have space for another team
-    fn add_team(&mut self, name: &'a str) -> &mut Self {
+    fn add_team(&mut self, name: &str) -> &mut Self {
         if self.teams[0].is_none() {
-            self.teams[0] = Some(name)
+            self.teams[0] = Some(name.to_string())
         } else if self.teams[1].is_none() {
-            self.teams[1] = Some(name)
+            self.teams[1] = Some(name.to_string())
         } else {
             panic!("Both teams already set!");
         }
@@ -132,8 +160,10 @@ impl<'a> Matchup<'a> {
     }
 
     fn get_team_display(&self, ind: MatchupInd) -> ColoredString {
-        let name = self.teams[ind.to_ind()].unwrap_or("___");
-        if self.team_won(ind) {
+        let name = self.teams[ind.to_ind()].as_deref().unwrap_or("___");
+        if !self.completed() {
+            name.normal()
+        } else if self.team_won(ind) {
             name.green()
         } else {
             name.red()
@@ -141,7 +171,7 @@ impl<'a> Matchup<'a> {
     }
 }
 
-impl<'a> Display for Matchup<'a> {
+impl Display for Matchup {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         writeln!(
             f,
@@ -153,12 +183,29 @@ impl<'a> Display for Matchup<'a> {
 }
 
 /// Tournament round
-#[derive(Copy, Clone, Debug, Serialize, Deserialize)]
+#[derive(Copy, Clone, Debug, Serialize, Deserialize, Eq, PartialEq, Hash)]
 pub enum RoundKind {
     /// Play-in round
     PlayIn,
     /// Round 1, 2, etc
     Round(usize),
+}
+
+impl RoundKind {
+    pub fn next_round(&self) -> Option<Self> {
+        match self {
+            RoundKind::PlayIn => Some(RoundKind::Round(1)),
+            RoundKind::Round(r) if r < &6 => Some(RoundKind::Round(r + 1)),
+            _ => None,
+        }
+    }
+
+    pub fn matchup_count(&self) -> usize {
+        match self {
+            RoundKind::PlayIn => 4,
+            RoundKind::Round(round) => 2_usize.pow((6 - round) as u32),
+        }
+    }
 }
 
 impl Display for RoundKind {
@@ -171,34 +218,58 @@ impl Display for RoundKind {
 }
 
 /// Round in a tournament
-pub struct Round<'a> {
+pub struct Round {
     /// What round this is
     pub round: RoundKind,
     /// The matchups in this round
-    pub matchups: Vec<Matchup<'a>>,
+    pub matchups: Vec<Matchup>,
 }
 
-impl<'a> Round<'a> {
+impl Round {
     /// Initialize an empty normal round
-    pub fn new(round: usize) -> Self {
-        let num_matchups = 2_usize.pow((6 - round) as u32);
-        let matchups = vec![Matchup::default(); num_matchups];
-        Self {
-            round: RoundKind::Round(round),
-            matchups,
-        }
+    pub fn empty(round: usize) -> Self {
+        let round = RoundKind::Round(round);
+        let num_matchups = round.matchup_count();
+        let matchups = (0..num_matchups).map(Matchup::new).collect();
+        Self { round, matchups }
     }
 
-    /// Initialize a round from a complete matchup set
-    pub fn with_matchups(round: usize, matchups: Vec<Matchup<'a>>) -> Self {
-        Self {
-            round: RoundKind::Round(round),
-            matchups,
+    pub fn add_team_to_matchup(&mut self, team: &str, ind: usize) {
+        self.matchups[ind].add_team(team);
+    }
+
+    pub fn new_round1(teams: &mut [Team]) -> Self {
+        teams.sort_by_key(|team| team.seed.0 as usize + team.region.to_ind() * 16);
+        let mut round = Self::empty(1);
+        debug_assert_eq!(round.round.matchup_count() * 2, teams.len());
+
+        for team in teams {
+            let matchup_ind = matchup_ind(team.seed.0) + 8 * team.region.to_ind();
+            round.add_team_to_matchup(team.name(), matchup_ind);
         }
+        round
+    }
+
+    pub fn get_matchup_with_team_mut(&mut self, team: &str) -> &mut Matchup {
+        for matchup in &mut self.matchups {
+            if matchup.includes_team(team) {
+                return matchup;
+            }
+        }
+        panic!("Team {} not found", team);
+    }
+
+    pub fn get_matchup_with_team(&self, team: &str) -> &Matchup {
+        for matchup in &self.matchups {
+            if matchup.includes_team(team) {
+                return matchup;
+            }
+        }
+        panic!("Team {} not found", team);
     }
 }
 
-impl<'a> Display for Round<'a> {
+impl Display for Round {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
@@ -232,55 +303,68 @@ fn matchup_ind(mut seed: u8) -> usize {
 }
 
 /// A complete tournament
-pub struct Tournament<'a> {
-    /// All rounds played
-    pub rounds: Vec<Round<'a>>,
+pub struct Tournament {
+    /// All rounds in this tournament
+    pub rounds: HashMap<RoundKind, Round>,
 }
 
-impl<'a> Tournament<'a> {
+impl Tournament {
     /// Initialize from a list of teams. The first round will be set using these teams
-    pub fn new(teams: &'a [Team]) -> Self {
-        let mut round1 = Round::new(1);
-        for team in teams {
-            let seed = team.seed.0;
-            let matchup_ind = matchup_ind(seed);
-            let matchup = round1
-                .matchups
-                .get_mut(matchup_ind + 8 * team.region.to_ind())
-                .unwrap();
-            matchup.add_team(team.name());
+    pub fn new(teams: &mut [Team], current_results: HashMap<RoundKind, HashSet<String>>) -> Self {
+        let mut rounds = HashMap::new();
+        let round1 = Round::new_round1(teams);
+        rounds.insert(round1.round, round1);
+
+        for round_num in 2..=6 {
+            let round = Round::empty(round_num);
+            rounds.insert(round.round, round);
         }
-        Self {
-            rounds: vec![round1],
+        let mut tournament = Self { rounds };
+        for round_kind in (1..=5).map(RoundKind::Round) {
+            let mut teams_to_advance = vec![];
+            if let Some(cur_teams) = current_results.get(&round_kind.next_round().unwrap()) {
+                let round = &tournament.rounds[&round_kind];
+                for matchup in &round.matchups {
+                    for ind in [0, 1] {
+                        if let Some(team) = &matchup.teams[ind] {
+                            let html_name = construct_html_name(team);
+                            if cur_teams.contains(&html_name) {
+                                teams_to_advance.push(team.clone());
+                            }
+                        }
+                    }
+                }
+            }
+
+            for team in teams_to_advance {
+                tournament.advance_team(&team, round_kind);
+            }
+        }
+        tournament
+    }
+
+    pub fn advance_team(&mut self, team: &str, round: RoundKind) {
+        self.get_round_mut(round)
+            .get_matchup_with_team_mut(team)
+            .set_winning_team(team);
+
+        let matchup_ind = self.rounds[&round].get_matchup_with_team(team).index;
+
+        let next_round_ind = matchup_ind / 2;
+        if let Some(next_round) = round.next_round() {
+            self.rounds.get_mut(&next_round).unwrap().matchups[next_round_ind].add_team(team);
         }
     }
 
-    /// Construct the next round of matchups from a completed previous round
-    pub fn initialize_next_round(&mut self) {
-        let prev_winners = self
-            .rounds
-            .last()
-            .unwrap()
-            .matchups
-            .iter()
-            .map(|matchup| matchup.winner())
-            .collect::<Vec<_>>();
-
-        let matchups = (0..(prev_winners.len() / 2))
-            .map(|i| Matchup {
-                teams: [Some(prev_winners[2 * i]), Some(prev_winners[2 * i + 1])],
-                winner: None,
-            })
-            .collect();
-        let round = Round::with_matchups(self.rounds.len() + 1, matchups);
-        self.rounds.push(round);
+    pub fn get_round_mut(&mut self, round: RoundKind) -> &mut Round {
+        self.rounds.get_mut(&round).unwrap()
     }
 }
 
-impl<'a> Display for Tournament<'a> {
+impl Display for Tournament {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        for round in &self.rounds {
-            write!(f, "{}", round)?;
+        for round_num in 1..=6 {
+            write!(f, "{}", self.rounds[&RoundKind::Round(round_num)])?;
         }
         Ok(())
     }

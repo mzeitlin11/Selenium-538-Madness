@@ -1,37 +1,60 @@
-use std::collections::HashSet;
+use std::collections::hash_map::Entry;
+use std::collections::{HashMap, HashSet};
 
-use anyhow::anyhow;
+use anyhow::{anyhow, Context};
 use rand::random;
 use scraper::{Html, Selector};
 use thirtyfour::{By, WebDriver, WebElement};
 
-use crate::teams::load_teams;
-use crate::tournament::{MatchupInd, Tournament};
+use crate::teams::{construct_html_name, load_teams};
+use crate::tournament::{RoundKind, Tournament};
 use crate::URL;
 
-/// Convert the 538 team name to an HTML-friendly name used in element classes
-fn construct_html_name(name: &str) -> String {
-    name.chars()
-        .filter(|&c| c == '-' || c.is_alphabetic())
-        .collect()
+/// For example, node-Kentucky-6 -> ("Kentucky", 6)
+fn extract_team_round_from_id(id: &str) -> anyhow::Result<(String, RoundKind)> {
+    let (left, seed_str) = id
+        .rsplit_once('-')
+        .ok_or_else(|| anyhow!("Unexpected format"))?;
+    let (_, team) = left
+        .split_once('-')
+        .ok_or_else(|| anyhow!("Unexpected format"))?;
+    let round = RoundKind::Round(7 - seed_str.parse::<usize>()?);
+    Ok((team.to_string(), round))
 }
 
-const PLAY_IN_LOSERS: [&str; 4] = ["Rutgers", "Wyoming", "Bryant", "TX A&amp;M-CC"];
-
+/// Simulate the tournament using 538 predictions from the current bracket state.
 pub async fn simulate(driver: &WebDriver) -> anyhow::Result<()> {
     driver.get(URL).await?;
-    let mut teams = load_teams()?;
-    teams.sort_by_key(|team| team.seed.0 as usize + team.region.to_ind() * 16);
-    teams.retain(|team| !PLAY_IN_LOSERS.contains(&team.name()));
-    let mut tournament = Tournament::new(&teams);
 
-    loop {
-        let round_num = tournament.rounds.len();
-        let curr_round = tournament.rounds.last_mut().unwrap();
+    let current_teams = get_current_teams(driver).await?;
+    let round1_teams = current_teams.get(&RoundKind::Round(1)).unwrap();
+    let mut teams = load_teams()?;
+
+    // Filter out teams who lost in the play-in. TODO: actually handle the play-in
+    teams.retain(|team| {
+        let html_name = construct_html_name(team.name());
+        round1_teams.contains(&html_name)
+    });
+    let mut tournament = Tournament::new(&mut teams, current_teams);
+
+    for round_num in 1..=6 {
+        let mut winning_teams = vec![];
+        let round_kind = RoundKind::Round(round_num);
+        let curr_round = tournament.get_round_mut(round_kind);
 
         for matchup in &mut curr_round.matchups {
+            if matchup.completed() {
+                continue;
+            }
             let teams = matchup.teams();
-            let win_perc = get_win_percent(driver, &teams[0], round_num).await?;
+            let win_perc = get_win_percent(driver, &teams[0], round_num)
+                .await
+                .with_context(|| {
+                    format!(
+                        "Could not find win percentage for {} vs {}",
+                        teams[0], teams[1]
+                    )
+                })?;
 
             log::info!(
                 "{} has a {}% to win against {}",
@@ -40,23 +63,57 @@ pub async fn simulate(driver: &WebDriver) -> anyhow::Result<()> {
                 teams[1]
             );
 
-            if random::<f32>() < (win_perc as f32 / 100.) {
-                matchup.set_winner(MatchupInd::Team1);
+            let winning_team = if random::<f32>() < (win_perc as f32 / 100.) {
+                &teams[0]
             } else {
-                matchup.set_winner(MatchupInd::Team2);
-            }
-            let team = matchup.winner();
-            log::info!("{} won!", team);
-            click_team(driver, team, round_num).await?;
+                &teams[1]
+            };
+            winning_teams.push(winning_team.clone());
+            log::info!("{} won!", winning_team);
+            click_team(driver, winning_team, round_num).await?;
         }
 
-        if curr_round.matchups.len() == 1 {
-            break;
+        for team in &winning_teams {
+            tournament.advance_team(team, round_kind);
         }
-        tournament.initialize_next_round();
     }
     log::info!("Tournament results: {}\n\n", tournament);
     Ok(())
+}
+
+/// Get a map of round to team currently advanced to that round
+async fn get_current_teams(
+    driver: &WebDriver,
+) -> anyhow::Result<HashMap<RoundKind, HashSet<String>>> {
+    let html = driver
+        .find_element(By::Css("g.nodes"))
+        .await?
+        .inner_html()
+        .await?;
+    let parsed = Html::parse_fragment(&html);
+    let selector = Selector::parse("g.node").unwrap();
+    let mut res: HashMap<_, HashSet<_>> = HashMap::new();
+    for node in parsed.select(&selector) {
+        let id = node
+            .value()
+            .id
+            .as_ref()
+            .map(|a| a.to_string())
+            .unwrap_or_default();
+        if let Ok((team, round)) = extract_team_round_from_id(&id) {
+            match res.entry(round) {
+                Entry::Occupied(mut teams) => {
+                    teams.get_mut().insert(team);
+                }
+                Entry::Vacant(entry) => {
+                    let mut teams = HashSet::new();
+                    teams.insert(team);
+                    entry.insert(teams);
+                }
+            }
+        }
+    }
+    Ok(res)
 }
 
 /// Get the win% for this team in the given round. This requires 2 steps:
@@ -87,7 +144,11 @@ async fn get_win_percent(driver: &WebDriver, team: &str, round_num: usize) -> an
             let text = node.text().collect::<Vec<_>>();
             // We should have one text element here if we've found the win %
             if text.len() == 1 {
-                return Ok(text[0].replace('%', "").parse()?);
+                return Ok(match text[0] {
+                    ">99%" => 100,
+                    "<1%" => 0,
+                    t => t.replace('%', "").parse()?,
+                });
             }
         }
     }

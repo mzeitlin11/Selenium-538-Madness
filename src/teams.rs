@@ -79,3 +79,10 @@ pub fn load_teams() -> anyhow::Result<Vec<Team>> {
     let reader = BufReader::new(File::open(TEAMS_PATH_538)?);
     Ok(serde_json::from_reader(reader)?)
 }
+
+/// Convert the 538 team name to an HTML-friendly name used in element classes
+pub fn construct_html_name(name: &str) -> String {
+    name.chars()
+        .filter(|&c| c == '-' || c.is_alphabetic())
+        .collect()
+}
